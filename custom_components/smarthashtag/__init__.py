@@ -104,7 +104,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     Returns:
         bool: True if all platforms were successfully unloaded, False otherwise.
     Raises:
-        Exception: Propagates any exceptions raised by the unload process.
+        Exception: Propagates any exceptions raised during the unload process.
     """
     return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
 

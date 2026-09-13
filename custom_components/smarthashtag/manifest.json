@@ -1,12 +1,16 @@
 {
   "domain": "smarthashtag",
   "name": "Smart",
-  "codeowners": ["@DasBasti"],
+  "codeowners": [
+    "@DasBasti"
+  ],
   "config_flow": true,
   "documentation": "https://github.com/DasBasti/SmartHashtag",
   "integration_type": "device",
   "iot_class": "cloud_polling",
   "issue_tracker": "https://github.com/DasBasti/SmartHashtag/issues",
-  "requirements": ["pysmarthashtag==0.12.2"],
-  "version": "0.8.9"
+  "requirements": [
+    "pysmarthashtag==0.12.2"
+  ],
+  "version": "0.9.0"
 }

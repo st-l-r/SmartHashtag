@@ -1,4 +1,4 @@
-"""Central locking support for Smart #1 / #3 / #5."""
+"""Central locking support for Smart vehicles."""
 
 from __future__ import annotations
 
@@ -105,12 +105,19 @@ class SmartCentralLock(SmartHashtagEntity, LockEntity):
             safety.door_lock_status_passenger,
             safety.door_lock_status_passenger_rear,
         ]
-        known_states = [state for state in door_states if state in (0, 1)]
 
-        if len(known_states) != len(door_states):
+        if not all(state in (0, 1) for state in door_states):
             return None
 
-        return all(state == 1 for state in known_states)
+        if all(state == 1 for state in door_states):
+            return True
+
+        if all(state == 0 for state in door_states):
+            return False
+
+        # Mixed lock states should not be represented as simply "unlocked".
+        LOGGER.debug("Mixed Smart door lock states: %s", door_states)
+        return None
 
     @property
     def is_locked(self) -> bool | None:
@@ -239,12 +246,11 @@ class SmartCentralLock(SmartHashtagEntity, LockEntity):
                 "The configured Smart vehicle is currently unavailable"
             )
 
-        # Same SSL preparation used by pySmartHashtag's existing controls.
         await account._ensure_ssl_context()
 
         for attempt in range(1, MAX_COMMAND_ATTEMPTS + 1):
             try:
-                # Remote-control requests require the VIN to be bound to the
+                # Remote commands require the VIN to be selected/bound to the
                 # current Smart API session.
                 await account.select_active_vehicle(self._vehicle_vin)
 
@@ -290,67 +296,97 @@ class SmartCentralLock(SmartHashtagEntity, LockEntity):
 
                 code = result.get("code")
                 message = result.get("message") or "unknown cloud response"
-                operation_result = (
-                    result.get("data", {})
-                    .get("serviceResult", {})
-                    .get("operationResult")
-                    if isinstance(result.get("data"), dict)
+                data = result.get("data")
+                service_result = (
+                    data.get("serviceResult")
+                    if isinstance(data, dict)
                     else None
                 )
+                operation_result = (
+                    service_result.get("operationResult")
+                    if isinstance(service_result, dict)
+                    else None
+                )
+
                 raise HomeAssistantError(
                     f"Smart cloud rejected {action} command "
                     f"(code={code}, operationResult={operation_result}): {message}"
                 )
 
-            except (
-                SmartTokenRefreshNecessary,
-                SmartMainTokenExpiredError,
-            ) as err:
+            except SmartTokenRefreshNecessary as err:
                 last_error = err
                 if attempt >= MAX_COMMAND_ATTEMPTS:
                     break
 
                 LOGGER.debug(
-                    "Smart token expired during %s; refreshing before retry %d/%d",
+                    "Smart API session expired during %s; "
+                    "refreshing before retry %d/%d",
                     action,
                     attempt + 1,
                     MAX_COMMAND_ATTEMPTS,
                 )
-                await account.config.authentication.refresh()
+                try:
+                    await account.config.authentication.refresh()
+                except (SmartAPIError, httpx.HTTPError) as refresh_err:
+                    raise HomeAssistantError(
+                        "Failed to refresh the Smart API session"
+                    ) from refresh_err
+
+            except SmartMainTokenExpiredError as err:
+                last_error = err
+                if attempt >= MAX_COMMAND_ATTEMPTS:
+                    break
+
+                # pySmartHashtag documents 1501/8500 as an OAuth/main-token
+                # expiry that cannot be repaired by the cheap session refresh.
+                LOGGER.debug(
+                    "Smart OAuth token expired during %s; "
+                    "performing full login before retry %d/%d",
+                    action,
+                    attempt + 1,
+                    MAX_COMMAND_ATTEMPTS,
+                )
+                try:
+                    await account.config.authentication.login()
+                except (SmartAPIError, httpx.HTTPError) as login_err:
+                    raise HomeAssistantError(
+                        "Failed to renew Smart account authentication"
+                    ) from login_err
 
             except (
                 SmartHumanCarConnectionError,
                 SmartVehicleNotInUseError,
+                SmartNonceError,
             ) as err:
                 last_error = err
                 if attempt >= MAX_COMMAND_ATTEMPTS:
                     break
 
-                # The next iteration calls select_active_vehicle() again.
+                # The next loop performs a fresh vehicle selection, timestamp,
+                # nonce and signature.
                 LOGGER.debug(
-                    "Smart VIN binding lost during %s; retrying %d/%d",
+                    "Transient Smart API error during %s (%s); retrying %d/%d",
                     action,
-                    attempt + 1,
-                    MAX_COMMAND_ATTEMPTS,
-                )
-
-            except SmartNonceError as err:
-                last_error = err
-                if attempt >= MAX_COMMAND_ATTEMPTS:
-                    break
-
-                # The next iteration creates a fresh timestamp/signature.
-                LOGGER.debug(
-                    "Smart API nonce collision during %s; retrying %d/%d",
-                    action,
+                    type(err).__name__,
                     attempt + 1,
                     MAX_COMMAND_ATTEMPTS,
                 )
 
             except SmartVehicleUnboundError as err:
-                raise HomeAssistantError(
-                    "The Smart vehicle is no longer bound to this account"
-                ) from err
+                # The coordinator treats an isolated 8040 as potentially
+                # transient immediately after a session refresh. Do the same
+                # here, but fail after the bounded retry count.
+                last_error = err
+                if attempt >= MAX_COMMAND_ATTEMPTS:
+                    break
+
+                LOGGER.debug(
+                    "Smart vehicle temporarily reported as unbound during %s; "
+                    "retrying %d/%d",
+                    action,
+                    attempt + 1,
+                    MAX_COMMAND_ATTEMPTS,
+                )
 
             except SmartNoPermissionError as err:
                 raise HomeAssistantError(

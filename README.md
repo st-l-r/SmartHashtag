@@ -27,6 +27,26 @@
 
 [![Open your Home Assistant instance and start setting up a new integration.](https://my.home-assistant.io/badges/config_flow_start.svg)](https://my.home-assistant.io/redirect/config_flow_start/?domain=smarthashtag)
 
+## Remote Central Locking
+
+The integration exposes the vehicle's central locking as a Home Assistant
+`lock` entity.
+
+Supported actions:
+
+- Lock all vehicle doors
+- Unlock all vehicle doors
+- Report the current lock state
+- Show `locking` / `unlocking` while waiting for vehicle telemetry confirmation
+
+The remote lock/unlock commands have been tested successfully on a Smart #1
+using the European Smart cloud API.
+
+The implementation uses the Smart remote services:
+
+- `RDL_2` for locking
+- `RDU_2` for unlocking
+
 ## Connect to ABRP
 
 [@chriscatuk](https://github.com/chriscatuk) integrated [A Better Route Planner](https://abetterrouteplanner.com/) with data from this component. To automatically send the information everytime the component updates, add this to your automations.

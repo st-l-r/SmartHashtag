@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import timedelta
 from time import monotonic
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 import httpx
 from homeassistant.components.lock import LockEntity
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers.event import async_call_later
 from pysmarthashtag.api import utils
 from pysmarthashtag.api.client import SmartClient
 from pysmarthashtag.const import API_TELEMATICS_URL
@@ -77,12 +79,15 @@ class SmartCentralLock(SmartHashtagEntity, LockEntity):
     ) -> None:
         """Initialize the central-lock entity."""
         super().__init__(coordinator)
+
         self._vehicle_vin = vehicle_vin
         self._attr_unique_id = f"{self._attr_unique_id}_central_lock"
         self._attr_name = "Central locking"
 
+        self._command_lock = asyncio.Lock()
         self._pending_target: bool | None = None
         self._pending_until = 0.0
+        self._pending_timeout_cancel: Callable[[], None] | None = None
 
     def _get_lock_state(self) -> bool | None:
         """Return the cached lock state without performing API I/O."""
@@ -93,12 +98,10 @@ class SmartCentralLock(SmartHashtagEntity, LockEntity):
         safety = vehicle.safety
 
         # Confirmed on Smart #1:
-        # centralLockingStatus 1 = locked, 0 = unlocked.
-        central_state = safety.central_locking_status
-        if central_state in (0, 1):
-            return central_state == 1
-
-        # Fallback for responses where the central state is not available.
+        # doorLockStatus* = 1 when locked, 0 when unlocked.
+        #
+        # Prefer the individual door states when all four are available so
+        # a mixed/stale state is not incorrectly reported as safely locked.
         door_states = [
             safety.door_lock_status_driver,
             safety.door_lock_status_driver_rear,
@@ -106,17 +109,22 @@ class SmartCentralLock(SmartHashtagEntity, LockEntity):
             safety.door_lock_status_passenger_rear,
         ]
 
-        if not all(state in (0, 1) for state in door_states):
+        if all(state in (0, 1) for state in door_states):
+            if all(state == 1 for state in door_states):
+                return True
+
+            if all(state == 0 for state in door_states):
+                return False
+
+            LOGGER.debug("Mixed Smart door lock states: %s", door_states)
             return None
 
-        if all(state == 1 for state in door_states):
-            return True
+        # Fallback confirmed on Smart #1:
+        # centralLockingStatus = 1 when locked, 0 when unlocked.
+        central_state = safety.central_locking_status
+        if central_state in (0, 1):
+            return central_state == 1
 
-        if all(state == 0 for state in door_states):
-            return False
-
-        # Mixed lock states should not be represented as simply "unlocked".
-        LOGGER.debug("Mixed Smart door lock states: %s", door_states)
         return None
 
     @property
@@ -152,28 +160,45 @@ class SmartCentralLock(SmartHashtagEntity, LockEntity):
 
     async def _execute_command(self, lock: bool) -> None:
         """Send a command and temporarily poll quickly for confirmation."""
-        if self._pending_target is not None:
-            self._clear_pending_command()
+        async with self._command_lock:
+            if self._pending_target is not None:
+                self._clear_pending_command()
 
-        await self._send_lock_command(lock)
+            await self._send_lock_command(lock)
 
-        self._pending_target = lock
-        self._pending_until = monotonic() + COMMAND_CONFIRM_TIMEOUT
-        self.coordinator.set_update_interval(
-            UPDATE_INTERVAL_KEY,
-            timedelta(seconds=FAST_INTERVAL),
-        )
+            self._pending_target = lock
+            self._pending_until = monotonic() + COMMAND_CONFIRM_TIMEOUT
 
-        # Expose the locking/unlocking state immediately.
-        self.async_write_ha_state()
+            self.coordinator.set_update_interval(
+                UPDATE_INTERVAL_KEY,
+                timedelta(seconds=FAST_INTERVAL),
+            )
 
-        # Request fresh telemetry now; normal coordinator updates continue
-        # at FAST_INTERVAL until the command is confirmed or times out.
-        await self.coordinator.async_request_refresh()
+            # Ensure fast polling is always reset even if no successful
+            # coordinator update arrives during the confirmation window.
+            self._pending_timeout_cancel = async_call_later(
+                self.hass,
+                COMMAND_CONFIRM_TIMEOUT,
+                self._handle_pending_timeout,
+            )
+
+            # Expose LOCKING / UNLOCKING immediately in Home Assistant.
+            self.async_write_ha_state()
+
+            # Ask for fresh telemetry immediately. A failed refresh must not
+            # turn an already accepted remote command into a service failure;
+            # the coordinator will retry on its normal/fast schedule.
+            try:
+                await self.coordinator.async_request_refresh()
+            except Exception as err:
+                LOGGER.debug(
+                    "Immediate telemetry refresh after Smart lock command failed: %s",
+                    err,
+                )
 
     @callback
     def _handle_coordinator_update(self) -> None:
-        """Handle fresh telemetry and stop fast polling when appropriate."""
+        """Handle fresh telemetry and stop fast polling after confirmation."""
         if self._pending_target is not None:
             current_state = self._get_lock_state()
 
@@ -182,25 +207,46 @@ class SmartCentralLock(SmartHashtagEntity, LockEntity):
                     "Smart central-lock command confirmed by vehicle telemetry"
                 )
                 self._clear_pending_command()
-            elif monotonic() >= self._pending_until:
-                LOGGER.warning(
-                    "Smart central-lock command was accepted by the cloud but "
-                    "not confirmed by vehicle telemetry within %s seconds",
-                    COMMAND_CONFIRM_TIMEOUT,
-                )
-                self._clear_pending_command()
 
         super()._handle_coordinator_update()
 
+    @callback
+    def _handle_pending_timeout(self, _now: Any) -> None:
+        """Stop fast polling when telemetry did not confirm the command."""
+        self._pending_timeout_cancel = None
+
+        if self._pending_target is None:
+            return
+
+        LOGGER.warning(
+            "Smart central-lock command was accepted by the cloud but "
+            "not confirmed by vehicle telemetry within %s seconds",
+            COMMAND_CONFIRM_TIMEOUT,
+        )
+
+        self._clear_pending_command()
+        self.async_write_ha_state()
+
     def _clear_pending_command(self) -> None:
-        """Clear pending state and restore the normal polling interval."""
+        """Clear pending command state and restore the normal poll interval."""
+        if self._pending_timeout_cancel is not None:
+            self._pending_timeout_cancel()
+            self._pending_timeout_cancel = None
+
         self._pending_target = None
         self._pending_until = 0.0
         self.coordinator.reset_update_interval(UPDATE_INTERVAL_KEY)
 
+    async def async_will_remove_from_hass(self) -> None:
+        """Clean up timers and polling changes when the entity is removed."""
+        if self._pending_target is not None or self._pending_timeout_cancel is not None:
+            self._clear_pending_command()
+
+        await super().async_will_remove_from_hass()
+
     @staticmethod
     def _build_payload(lock: bool) -> str:
-        """Build the Smart telematics lock/unlock payload."""
+        """Build the confirmed Smart telematics lock/unlock payload."""
         payload = {
             "creator": "tc",
             "operationScheduling": {
@@ -212,8 +258,14 @@ class SmartCentralLock(SmartHashtagEntity, LockEntity):
             "serviceId": SERVICE_ID_LOCK if lock else SERVICE_ID_UNLOCK,
             "command": "start",
             "timestamp": utils.create_correct_timestamp(),
-            "serviceParameters": [{"key": "door", "value": "all"}],
+            "serviceParameters": [
+                {
+                    "key": "door",
+                    "value": "all",
+                }
+            ],
         }
+
         return json.dumps(payload, separators=(",", ":"))
 
     @staticmethod
@@ -234,6 +286,18 @@ class SmartCentralLock(SmartHashtagEntity, LockEntity):
             and service_result.get("error") is None
         )
 
+    async def _refresh_authentication(self, action: str) -> None:
+        """Refresh Smart authentication using pySmartHashtag's refresh ladder."""
+        try:
+            # In pySmartHashtag 0.12.3 refresh() performs:
+            # API-session refresh -> refresh-token exchange -> full login.
+            await self.coordinator.account.config.authentication.refresh()
+        except (SmartAPIError, httpx.HTTPError) as err:
+            raise HomeAssistantError(
+                f"Failed to renew Smart authentication while trying to {action} "
+                "the vehicle"
+            ) from err
+
     async def _send_lock_command(self, lock: bool) -> None:
         """Send a lock/unlock command to the Smart cloud."""
         account = self.coordinator.account
@@ -246,12 +310,15 @@ class SmartCentralLock(SmartHashtagEntity, LockEntity):
                 "The configured Smart vehicle is currently unavailable"
             )
 
+        # SmartClient uses the account's pre-created SSL context so Home
+        # Assistant does not perform certificate setup in the event loop.
         await account._ensure_ssl_context()
 
         for attempt in range(1, MAX_COMMAND_ATTEMPTS + 1):
             try:
                 # Remote commands require the VIN to be selected/bound to the
-                # current Smart API session.
+                # current Smart API session. select_active_vehicle() also has
+                # its own bounded retry handling for session/binding failures.
                 await account.select_active_vehicle(self._vehicle_vin)
 
                 vehicle = account.vehicles.get(self._vehicle_vin)
@@ -287,7 +354,7 @@ class SmartCentralLock(SmartHashtagEntity, LockEntity):
                     )
 
                 if self._command_succeeded(result):
-                    LOGGER.info(
+                    LOGGER.debug(
                         "Smart %s command accepted (serviceId=%s)",
                         action,
                         service_id,
@@ -296,6 +363,7 @@ class SmartCentralLock(SmartHashtagEntity, LockEntity):
 
                 code = result.get("code")
                 message = result.get("message") or "unknown cloud response"
+
                 data = result.get("data")
                 service_result = (
                     data.get("serviceResult")
@@ -313,45 +381,22 @@ class SmartCentralLock(SmartHashtagEntity, LockEntity):
                     f"(code={code}, operationResult={operation_result}): {message}"
                 )
 
-            except SmartTokenRefreshNecessary as err:
+            except (
+                SmartTokenRefreshNecessary,
+                SmartMainTokenExpiredError,
+            ) as err:
                 last_error = err
                 if attempt >= MAX_COMMAND_ATTEMPTS:
                     break
 
                 LOGGER.debug(
-                    "Smart API session expired during %s; "
+                    "Smart authentication expired during %s; "
                     "refreshing before retry %d/%d",
                     action,
                     attempt + 1,
                     MAX_COMMAND_ATTEMPTS,
                 )
-                try:
-                    await account.config.authentication.refresh()
-                except (SmartAPIError, httpx.HTTPError) as refresh_err:
-                    raise HomeAssistantError(
-                        "Failed to refresh the Smart API session"
-                    ) from refresh_err
-
-            except SmartMainTokenExpiredError as err:
-                last_error = err
-                if attempt >= MAX_COMMAND_ATTEMPTS:
-                    break
-
-                # pySmartHashtag documents 1501/8500 as an OAuth/main-token
-                # expiry that cannot be repaired by the cheap session refresh.
-                LOGGER.debug(
-                    "Smart OAuth token expired during %s; "
-                    "performing full login before retry %d/%d",
-                    action,
-                    attempt + 1,
-                    MAX_COMMAND_ATTEMPTS,
-                )
-                try:
-                    await account.config.authentication.login()
-                except (SmartAPIError, httpx.HTTPError) as login_err:
-                    raise HomeAssistantError(
-                        "Failed to renew Smart account authentication"
-                    ) from login_err
+                await self._refresh_authentication(action)
 
             except (
                 SmartHumanCarConnectionError,
@@ -362,8 +407,8 @@ class SmartCentralLock(SmartHashtagEntity, LockEntity):
                 if attempt >= MAX_COMMAND_ATTEMPTS:
                     break
 
-                # The next loop performs a fresh vehicle selection, timestamp,
-                # nonce and signature.
+                # The next iteration re-selects the VIN and creates a fresh
+                # request timestamp/signature/nonce.
                 LOGGER.debug(
                     "Transient Smart API error during %s (%s); retrying %d/%d",
                     action,
@@ -373,13 +418,13 @@ class SmartCentralLock(SmartHashtagEntity, LockEntity):
                 )
 
             except SmartVehicleUnboundError as err:
-                # The coordinator treats an isolated 8040 as potentially
-                # transient immediately after a session refresh. Do the same
-                # here, but fail after the bounded retry count.
                 last_error = err
                 if attempt >= MAX_COMMAND_ATTEMPTS:
                     break
 
+                # The integration itself treats an isolated 8040 as possibly
+                # transient immediately after session renewal. Use the same
+                # bounded approach here; the next iteration selects the VIN.
                 LOGGER.debug(
                     "Smart vehicle temporarily reported as unbound during %s; "
                     "retrying %d/%d",
@@ -401,7 +446,12 @@ class SmartCentralLock(SmartHashtagEntity, LockEntity):
                     f"Smart API error while trying to {action} the vehicle: {err}"
                 ) from err
 
-            except httpx.HTTPError as err:
+            except httpx.HTTPStatusError as err:
+                raise HomeAssistantError(
+                    f"Smart cloud rejected the {action} request: {err}"
+                ) from err
+
+            except httpx.RequestError as err:
                 raise HomeAssistantError(
                     f"Network error while trying to {action} the vehicle"
                 ) from err
@@ -410,6 +460,11 @@ class SmartCentralLock(SmartHashtagEntity, LockEntity):
                 raise HomeAssistantError(
                     f"Invalid Smart cloud response while trying to {action} the vehicle"
                 ) from err
+
+        if isinstance(last_error, SmartVehicleUnboundError):
+            raise HomeAssistantError(
+                "The Smart vehicle is reported as unbound from this account"
+            ) from last_error
 
         raise HomeAssistantError(
             f"Unable to {action} the Smart vehicle after "

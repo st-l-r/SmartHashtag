@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import timedelta
+from datetime import datetime, timedelta
 from time import monotonic
 from typing import TYPE_CHECKING, Any, Callable
+from urllib.parse import urlparse
 
 import httpx
 from homeassistant.components.lock import LockEntity
@@ -58,7 +59,8 @@ async def async_setup_entry(
 
     vehicles = coordinator.account.vehicles or {}
     if vehicle_vin not in vehicles:
-        LOGGER.error("Vehicle %s not available; skipping lock setup", vehicle_vin)
+        # Avoid putting a VIN into logs unnecessarily.
+        LOGGER.error("Configured vehicle is not available; skipping lock setup")
         return
 
     async_add_entities(
@@ -84,13 +86,47 @@ class SmartCentralLock(SmartHashtagEntity, LockEntity):
         self._attr_unique_id = f"{self._attr_unique_id}_central_lock"
         self._attr_name = "Central locking"
 
+        # Serialize commands issued through this entity. This avoids overlapping
+        # lock/unlock requests from a double tap or competing HA automations.
         self._command_lock = asyncio.Lock()
+
         self._pending_target: bool | None = None
         self._pending_until = 0.0
         self._pending_timeout_cancel: Callable[[], None] | None = None
 
-    def _get_lock_state(self) -> bool | None:
-        """Return the cached lock state without performing API I/O."""
+        # Security invariant:
+        # after the cloud accepts a physical lock/unlock command, cached
+        # pre-command telemetry must not be presented as a trustworthy state.
+        # It becomes trustworthy again only after vehicle telemetry carries a
+        # newer Safety timestamp than the snapshot observed before the command.
+        self._telemetry_uncertain = False
+        self._command_baseline_timestamp: datetime | None = None
+
+    def _get_safety_timestamp(self) -> datetime | None:
+        """Return the timestamp of the cached safety telemetry."""
+        vehicle = self.coordinator.account.vehicles.get(self._vehicle_vin)
+        if vehicle is None or vehicle.safety is None:
+            return None
+
+        timestamp = vehicle.safety.timestamp
+        return timestamp if isinstance(timestamp, datetime) else None
+
+    def _has_fresh_post_command_telemetry(self) -> bool:
+        """Return whether safety telemetry is newer than the pre-command data."""
+        current = self._get_safety_timestamp()
+        if current is None:
+            return False
+
+        baseline = self._command_baseline_timestamp
+        if baseline is None:
+            # There was no timestamp before the command, so the first valid
+            # timestamp seen afterwards is new information.
+            return True
+
+        return current > baseline
+
+    def _get_raw_lock_state(self) -> bool | None:
+        """Return cached lock telemetry without applying freshness rules."""
         vehicle = self.coordinator.account.vehicles.get(self._vehicle_vin)
         if vehicle is None or vehicle.safety is None:
             return None
@@ -100,8 +136,8 @@ class SmartCentralLock(SmartHashtagEntity, LockEntity):
         # Confirmed on Smart #1:
         # doorLockStatus* = 1 when locked, 0 when unlocked.
         #
-        # Prefer the individual door states when all four are available so
-        # a mixed/stale state is not incorrectly reported as safely locked.
+        # Prefer all four individual door states. A mixed state is deliberately
+        # reported as unknown rather than as unlocked or locked.
         door_states = [
             safety.door_lock_status_driver,
             safety.door_lock_status_driver_rear,
@@ -127,6 +163,13 @@ class SmartCentralLock(SmartHashtagEntity, LockEntity):
 
         return None
 
+    def _get_lock_state(self) -> bool | None:
+        """Return a trustworthy cached lock state, or unknown when stale."""
+        if self._telemetry_uncertain:
+            return None
+
+        return self._get_raw_lock_state()
+
     @property
     def is_locked(self) -> bool | None:
         """Return whether the vehicle is centrally locked."""
@@ -138,7 +181,10 @@ class SmartCentralLock(SmartHashtagEntity, LockEntity):
         return (
             self._pending_target is True
             and monotonic() < self._pending_until
-            and self._get_lock_state() is not True
+            and (
+                self._telemetry_uncertain
+                or self._get_raw_lock_state() is not True
+            )
         )
 
     @property
@@ -147,7 +193,10 @@ class SmartCentralLock(SmartHashtagEntity, LockEntity):
         return (
             self._pending_target is False
             and monotonic() < self._pending_until
-            and self._get_lock_state() is not False
+            and (
+                self._telemetry_uncertain
+                or self._get_raw_lock_state() is not False
+            )
         )
 
     async def async_lock(self, **kwargs: Any) -> None:
@@ -164,8 +213,17 @@ class SmartCentralLock(SmartHashtagEntity, LockEntity):
             if self._pending_target is not None:
                 self._clear_pending_command()
 
+            # Capture the telemetry snapshot BEFORE the physical command is sent.
+            # Any identical timestamp seen afterwards is still stale data.
+            baseline_timestamp = self._get_safety_timestamp()
+
             await self._send_lock_command(lock)
 
+            # The Smart cloud has accepted the command. From this point onward
+            # the old cached state is no longer authoritative until a newer
+            # Safety snapshot arrives.
+            self._command_baseline_timestamp = baseline_timestamp
+            self._telemetry_uncertain = True
             self._pending_target = lock
             self._pending_until = monotonic() + COMMAND_CONFIRM_TIMEOUT
 
@@ -187,7 +245,7 @@ class SmartCentralLock(SmartHashtagEntity, LockEntity):
 
             # Ask for fresh telemetry immediately. A failed refresh must not
             # turn an already accepted remote command into a service failure;
-            # the coordinator will retry on its normal/fast schedule.
+            # the coordinator will continue retrying on its normal/fast schedule.
             try:
                 await self.coordinator.async_request_refresh()
             except Exception as err:
@@ -199,6 +257,12 @@ class SmartCentralLock(SmartHashtagEntity, LockEntity):
     @callback
     def _handle_coordinator_update(self) -> None:
         """Handle fresh telemetry and stop fast polling after confirmation."""
+        if self._telemetry_uncertain and self._has_fresh_post_command_telemetry():
+            # A newer vehicle Safety snapshot exists. Its lock state may or may
+            # not match the requested target, but it is no longer stale.
+            self._telemetry_uncertain = False
+            LOGGER.debug("Fresh post-command Smart safety telemetry received")
+
         if self._pending_target is not None:
             current_state = self._get_lock_state()
 
@@ -206,7 +270,12 @@ class SmartCentralLock(SmartHashtagEntity, LockEntity):
                 LOGGER.debug(
                     "Smart central-lock command confirmed by vehicle telemetry"
                 )
+                self._command_baseline_timestamp = None
                 self._clear_pending_command()
+
+        elif not self._telemetry_uncertain:
+            # No command is pending and the state is trustworthy again.
+            self._command_baseline_timestamp = None
 
         super()._handle_coordinator_update()
 
@@ -218,12 +287,27 @@ class SmartCentralLock(SmartHashtagEntity, LockEntity):
         if self._pending_target is None:
             return
 
-        LOGGER.warning(
-            "Smart central-lock command was accepted by the cloud but "
-            "not confirmed by vehicle telemetry within %s seconds",
-            COMMAND_CONFIRM_TIMEOUT,
-        )
+        if self._telemetry_uncertain:
+            LOGGER.warning(
+                "Smart central-lock command was accepted by the cloud but no "
+                "fresh vehicle safety telemetry was received within %s seconds; "
+                "lock state will remain unknown until fresh telemetry arrives",
+                COMMAND_CONFIRM_TIMEOUT,
+            )
+        else:
+            LOGGER.warning(
+                "Smart central-lock command was accepted by the cloud but fresh "
+                "vehicle telemetry did not confirm the requested state within "
+                "%s seconds",
+                COMMAND_CONFIRM_TIMEOUT,
+            )
+            # Fresh telemetry exists, so the current state can be trusted even
+            # though the requested target was not reached.
+            self._command_baseline_timestamp = None
 
+        # Deliberately preserve _telemetry_uncertain when no fresh telemetry
+        # arrived. That prevents an old pre-command "locked" value from
+        # reappearing after an unconfirmed unlock operation.
         self._clear_pending_command()
         self.async_write_ha_state()
 
@@ -286,6 +370,44 @@ class SmartCentralLock(SmartHashtagEntity, LockEntity):
             and service_result.get("error") is None
         )
 
+    @staticmethod
+    def _validate_remote_base_url(base_url: str) -> str:
+        """Validate the endpoint before sending bearer credentials to it."""
+        if not isinstance(base_url, str) or not base_url:
+            raise HomeAssistantError("Smart remote-control API endpoint is unavailable")
+
+        parsed = urlparse(base_url)
+
+        # Access tokens used for physical vehicle control must never be sent
+        # over cleartext HTTP or to a URL containing embedded user credentials.
+        if (
+            parsed.scheme.lower() != "https"
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+        ):
+            raise HomeAssistantError(
+                "Refusing Smart remote-control request to an insecure API endpoint"
+            )
+
+        return base_url.rstrip("/")
+
+    @staticmethod
+    def _get_model_code(vehicle: Any) -> str:
+        """Return the vehicle matCode required for per-request VIN binding."""
+        data = getattr(vehicle, "data", None)
+        model_code = data.get("matCode") if isinstance(data, dict) else None
+
+        if not isinstance(model_code, str) or not model_code.strip():
+            # Fail closed: without the X-Vehicle-* headers the cloud may fall
+            # back to the account-wide active-vehicle binding, which another
+            # client can change between vehicle selection and command dispatch.
+            raise HomeAssistantError(
+                "Vehicle model code is unavailable; refusing remote lock command"
+            )
+
+        return model_code.strip()
+
     async def _refresh_authentication(self, action: str) -> None:
         """Refresh Smart authentication using pySmartHashtag's refresh ladder."""
         try:
@@ -316,9 +438,8 @@ class SmartCentralLock(SmartHashtagEntity, LockEntity):
 
         for attempt in range(1, MAX_COMMAND_ATTEMPTS + 1):
             try:
-                # Remote commands require the VIN to be selected/bound to the
-                # current Smart API session. select_active_vehicle() also has
-                # its own bounded retry handling for session/binding failures.
+                # The legacy active-vehicle binding is still performed because
+                # the Smart cloud expects it for remote services.
                 await account.select_active_vehicle(self._vehicle_vin)
 
                 vehicle = account.vehicles.get(self._vehicle_vin)
@@ -327,21 +448,28 @@ class SmartCentralLock(SmartHashtagEntity, LockEntity):
                         "The configured Smart vehicle is currently unavailable"
                     )
 
+                base_url = self._validate_remote_base_url(vehicle.base_url)
+                model_code = self._get_model_code(vehicle)
+                path = API_TELEMATICS_URL + self._vehicle_vin
                 params = self._build_payload(lock)
 
                 async with SmartClient(account.config) as client:
                     response = await client.put(
-                        vehicle.base_url
-                        + API_TELEMATICS_URL
-                        + self._vehicle_vin,
+                        base_url + path,
                         headers={
                             **utils.generate_default_header(
                                 client.config.authentication.device_id,
                                 client.config.authentication.api_access_token,
                                 params={},
                                 method="PUT",
-                                url=API_TELEMATICS_URL + self._vehicle_vin,
+                                url=path,
                                 body=params,
+                                # Security hardening supplied by
+                                # pySmartHashtag: bind this request explicitly
+                                # to the intended VIN/model in addition to the
+                                # mutable account-wide active-vehicle binding.
+                                vin=self._vehicle_vin,
+                                model_code=model_code,
                             )
                         },
                         content=params.encode("utf-8"),
@@ -362,8 +490,6 @@ class SmartCentralLock(SmartHashtagEntity, LockEntity):
                     return
 
                 code = result.get("code")
-                message = result.get("message") or "unknown cloud response"
-
                 data = result.get("data")
                 service_result = (
                     data.get("serviceResult")
@@ -376,9 +502,12 @@ class SmartCentralLock(SmartHashtagEntity, LockEntity):
                     else None
                 )
 
+                # Do not echo an arbitrary cloud-provided message into HA's
+                # user-visible error path. The numeric result is sufficient for
+                # diagnosis and avoids accidental disclosure of response data.
                 raise HomeAssistantError(
                     f"Smart cloud rejected {action} command "
-                    f"(code={code}, operationResult={operation_result}): {message}"
+                    f"(code={code}, operationResult={operation_result})"
                 )
 
             except (
@@ -408,7 +537,8 @@ class SmartCentralLock(SmartHashtagEntity, LockEntity):
                     break
 
                 # The next iteration re-selects the VIN and creates a fresh
-                # request timestamp/signature/nonce.
+                # request timestamp/signature/nonce. The command itself also
+                # carries explicit X-Vehicle-* binding headers.
                 LOGGER.debug(
                     "Transient Smart API error during %s (%s); retrying %d/%d",
                     action,
@@ -422,9 +552,6 @@ class SmartCentralLock(SmartHashtagEntity, LockEntity):
                 if attempt >= MAX_COMMAND_ATTEMPTS:
                     break
 
-                # The integration itself treats an isolated 8040 as possibly
-                # transient immediately after session renewal. Use the same
-                # bounded approach here; the next iteration selects the VIN.
                 LOGGER.debug(
                     "Smart vehicle temporarily reported as unbound during %s; "
                     "retrying %d/%d",
@@ -443,12 +570,12 @@ class SmartCentralLock(SmartHashtagEntity, LockEntity):
 
             except SmartAPIError as err:
                 raise HomeAssistantError(
-                    f"Smart API error while trying to {action} the vehicle: {err}"
+                    f"Smart API error while trying to {action} the vehicle"
                 ) from err
 
             except httpx.HTTPStatusError as err:
                 raise HomeAssistantError(
-                    f"Smart cloud rejected the {action} request: {err}"
+                    f"Smart cloud rejected the {action} request"
                 ) from err
 
             except httpx.RequestError as err:
